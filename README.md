@@ -3,7 +3,7 @@ PrediChain is a decentralized prediction market platform built on an Endless cha
 
 # Run
 1. Clone the repository
-git clone https://github.com/yourusername/predichain-endless-demo.git
+git clone (https://github.com/B-THD/PrediChain_Endless_move.git)
 cd predichain-endless-demo
 2. Install dependencies
 npm install

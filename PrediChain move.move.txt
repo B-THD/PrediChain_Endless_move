@@ -1,0 +1,195 @@
+// predichain.move - 主智能合约
+module predichain::prediction_market {
+    use std::signer;
+    use std::vector;
+    use std::string;
+    use aptos_framework::coin;
+    use aptos_framework::account;
+    
+    struct PredictionMarket<phantom CoinType> has key {
+        market_id: u64,
+        creator: address,
+        question: string::String,
+        description: string::String,
+        end_time: u64,
+        outcome_options: vector<string::String>,
+        total_pool: u64,
+        yes_pool: u64,
+        no_pool: u64,
+        resolution: bool, // true = resolved, false = pending
+        outcome: u8, // 0 = undecided, 1 = yes, 2 = no
+        is_active: bool,
+        participants: vector<address>,
+        created_at: u64
+    }
+    
+    struct UserPosition<phantom CoinType> has key {
+        market_id: u64,
+        amount_staked: u64,
+        position: u8, // 1 = yes, 2 = no
+        claimed: bool
+    }
+    
+    struct AIInsight has key {
+        market_id: u64,
+        confidence_score: u64, // 0-100
+        data_sources: vector<string::String>,
+        generated_at: u64,
+        reasoning: string::String
+    }
+    
+    // 创建新的预测市场
+    public entry fun create_market<CoinType>(
+        creator: &signer,
+        question: string::String,
+        description: string::String,
+        end_time: u64,
+        outcome_options: vector<string::String>
+    ) acquires PredictionMarket {
+        let market_id = generate_market_id();
+        let creator_addr = signer::address_of(creator);
+        
+        let market = PredictionMarket<CoinType> {
+            market_id,
+            creator: creator_addr,
+            question,
+            description,
+            end_time,
+            outcome_options,
+            total_pool: 0,
+            yes_pool: 0,
+            no_pool: 0,
+            resolution: false,
+            outcome: 0,
+            is_active: true,
+            participants: vector::empty<address>(),
+            created_at: timestamp::now_seconds()
+        };
+        
+        move_to(creator, market);
+        emit_event(MarketCreatedEvent { market_id, creator: creator_addr });
+    }
+    
+    // 参与预测
+    public entry fun place_bet<CoinType>(
+        user: &signer,
+        market_id: u64,
+        amount: u64,
+        position: u8
+    ) acquires PredictionMarket, UserPosition {
+        let user_addr = signer::address_of(user);
+        let market = borrow_global_mut<PredictionMarket<CoinType>>(get_market_address(market_id));
+        
+        // 验证市场状态
+        assert!(market.is_active, EINACTIVE_MARKET);
+        assert!(timestamp::now_seconds() < market.end_time, ETIME_EXPIRED);
+        
+        // 转移代币到合约
+        let coin_to_transfer = coin::withdraw<CoinType>(user, amount);
+        let market_address = get_market_address(market_id);
+        coin::deposit(market_address, coin_to_transfer);
+        
+        // 更新资金池
+        if (position == 1) {
+            market.yes_pool = market.yes_pool + amount;
+        } else {
+            market.no_pool = market.no_pool + amount;
+        }
+        market.total_pool = market.total_pool + amount;
+        
+        // 记录用户头寸
+        if (!exists<UserPosition<CoinType>>(user_addr)) {
+            move_to(user, UserPosition<CoinType> {
+                market_id,
+                amount_staked: amount,
+                position,
+                claimed: false
+            });
+        } else {
+            let user_pos = borrow_global_mut<UserPosition<CoinType>>(user_addr);
+            user_pos.amount_staked = user_pos.amount_staked + amount;
+        }
+        
+        // 添加到参与者列表
+        if (!vector::contains(&market.participants, &user_addr)) {
+            vector::push_back(&mut market.participants, user_addr);
+        }
+        
+        emit_event(BetPlacedEvent { market_id, user: user_addr, amount, position });
+        
+        // 触发AI分析（链下事件）
+        emit_event(AIAnalysisRequested { market_id, trigger_type: 1 }); // 1 = new bet placed
+    }
+    
+    // AI Agent提交洞察
+    public entry fun submit_ai_insight(
+        ai_agent: &signer,
+        market_id: u64,
+        confidence_score: u64,
+        data_sources: vector<string::String>,
+        reasoning: string::String
+    ) acquires AIInsight {
+        // 验证AI Agent身份（需要特定的权限）
+        assert!(is_ai_agent(signer::address_of(ai_agent)), ENOT_AI_AGENT);
+        
+        let insight = AIInsight {
+            market_id,
+            confidence_score,
+            data_sources,
+            generated_at: timestamp::now_seconds(),
+            reasoning
+        };
+        
+        move_to(ai_agent, insight);
+        emit_event(AIInsightSubmitted { market_id, confidence_score, agent: signer::address_of(ai_agent) });
+    }
+    
+    // 解决市场
+    public entry fun resolve_market<CoinType>(
+        resolver: &signer,
+        market_id: u64,
+        outcome: u8
+    ) acquires PredictionMarket {
+        let market = borrow_global_mut<PredictionMarket<CoinType>>(get_market_address(market_id));
+        
+        // 验证解决者权限（可以是创建者、DAO或特定的oracle）
+        assert!(can_resolve(signer::address_of(resolver), market_id), EUNAUTHORIZED);
+        assert!(timestamp::now_seconds() >= market.end_time, ETIME_NOT_REACHED);
+        assert!(!market.resolution, EALREADY_RESOLVED);
+        
+        market.resolution = true;
+        market.outcome = outcome;
+        market.is_active = false;
+        
+        emit_event(MarketResolvedEvent { market_id, outcome });
+    }
+    
+    // 领取奖励
+    public entry fun claim_rewards<CoinType>(
+        user: &signer,
+        market_id: u64
+    ) acquires PredictionMarket, UserPosition {
+        let user_addr = signer::address_of(user);
+        let market = borrow_global_mut<PredictionMarket<CoinType>>(get_market_address(market_id));
+        let user_pos = borrow_global_mut<UserPosition<CoinType>>(user_addr);
+        
+        assert!(market.resolution, ENOT_RESOLVED);
+        assert!(!user_pos.claimed, EALREADY_CLAIMED);
+        assert!(user_pos.market_id == market_id, EWRONG_MARKET);
+        
+        if (user_pos.position == market.outcome) {
+            // 计算奖励
+            let total_winning_pool = if (market.outcome == 1) market.yes_pool else market.no_pool;
+            let user_share = (user_pos.amount_staked * market.total_pool) / total_winning_pool;
+            let reward_amount = user_share;
+            
+            // 转移奖励
+            let market_address = get_market_address(market_id);
+            coin::transfer<CoinType>(market_address, user_addr, reward_amount);
+            
+            emit_event(RewardClaimed { market_id, user: user_addr, amount: reward_amount });
+        }
+        
+        user_pos.claimed = true;
+    }
+}
